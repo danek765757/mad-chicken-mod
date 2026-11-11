@@ -1,0 +1,132 @@
+name: Build Chicken King
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download project
+        uses: actions/checkout@v4
+
+      - name: Install Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Find Fabric dependencies
+        shell: python
+        run: |
+          import json
+          import re
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          MC = "1.21.11"
+
+          def fetch(url):
+              request = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "ChickenKingBuild/1.0"}
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return response.read()
+
+          def numbers(value):
+              return tuple(
+                  int(part) for part in re.findall(r"\d+", value)
+              )
+
+          yarns = json.loads(fetch(
+              f"https://meta.fabricmc.net/v2/versions/yarn/{MC}"
+          ))
+          if not yarns:
+              raise RuntimeError("No Yarn mappings found for " + MC)
+          yarn = yarns[0]["version"]
+
+          loaders = json.loads(fetch(
+              "https://meta.fabricmc.net/v2/versions/loader"
+          ))
+          stable_loaders = [
+              item for item in loaders if item.get("stable")
+          ]
+          loader = (stable_loaders or loaders)[0]["version"]
+
+          api_xml = ET.fromstring(fetch(
+              "https://maven.fabricmc.net/net/fabricmc/"
+              "fabric-api/fabric-api/maven-metadata.xml"
+          ))
+          api_versions = [
+              node.text
+              for node in api_xml.findall("./versioning/versions/version")
+              if node.text and node.text.endswith("+" + MC)
+          ]
+          if not api_versions:
+              raise RuntimeError("No Fabric API found for " + MC)
+          api = max(api_versions, key=numbers)
+
+          loom_xml = ET.fromstring(fetch(
+              "https://maven.fabricmc.net/net/fabricmc/"
+              "fabric-loom/maven-metadata.xml"
+          ))
+          loom_versions = [
+              node.text
+              for node in loom_xml.findall("./versioning/versions/version")
+              if node.text
+              and re.fullmatch(r"1\.14(?:\.\d+)+", node.text)
+          ]
+          if not loom_versions:
+              raise RuntimeError("No stable Loom 1.14 version found")
+          loom = max(loom_versions, key=numbers)
+
+          properties = {
+              "org.gradle.jvmargs": "-Xmx2G",
+              "org.gradle.parallel": "false",
+              "minecraft_version": MC,
+              "yarn_mappings": yarn,
+              "loader_version": loader,
+              "fabric_version": api,
+              "loom_version": loom,
+          }
+
+          with open("gradle.properties", "w", encoding="utf-8") as output:
+              for key, value in properties.items():
+                  output.write(f"{key}={value}\n")
+
+          print("Selected dependencies:")
+          for key, value in properties.items():
+              print(f"{key}={value}")
+
+      - name: Install Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.2.1'
+
+      - name: Build mod
+        run: gradle --no-daemon build
+
+      - name: Prepare download
+        shell: bash
+        run: |
+          mkdir -p download
+          find build/libs -maxdepth 1 -type f \
+            -name '*.jar' \
+            ! -name '*-sources.jar' \
+            ! -name '*-dev.jar' \
+            -exec cp {} download/ \;
+          cp gradle.properties download/BUILD-VERSIONS.txt
+          test -n "$(find download -name '*.jar' -print -quit)"
+
+      - name: Upload finished mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: chicken-king-minecraft-1.21.11
+          path: download/
+          if-no-files-found: error
